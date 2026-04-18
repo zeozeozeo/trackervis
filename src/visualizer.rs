@@ -26,40 +26,6 @@ pub struct FrameView<'a> {
     pub module: FrameModule<'a>,
 }
 
-#[derive(Debug, Clone)]
-pub struct RasterImage {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
-}
-
-impl RasterImage {
-    pub fn new(width: u32, height: u32) -> Self {
-        Self {
-            width,
-            height,
-            data: vec![0; width as usize * height as usize * 4],
-        }
-    }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    pub fn as_raw(&self) -> &[u8] {
-        &self.data
-    }
-
-    fn put_pixel(&mut self, x: u32, y: u32, rgba: [u8; 4]) {
-        let offset = ((y as usize * self.width as usize) + x as usize) * 4;
-        self.data[offset..offset + 4].copy_from_slice(&rgba);
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct LayoutCell {
     rect: [f32; 4],
@@ -72,7 +38,7 @@ struct LayoutGrid {
 }
 
 const BACKGROUND: [u8; 4] = [0, 0, 0, 255];
-const GRID: [u8; 4] = [146, 196, 255, 255];
+const GRID: [u8; 4] = [255, 255, 255, 255];
 const CROSSHAIR: [u8; 4] = [112, 112, 112, 255];
 const TRACE: [u8; 4] = [255, 255, 255, 255];
 const TEXT: [u8; 4] = [255, 255, 255, 255];
@@ -166,76 +132,6 @@ pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>) {
     }
 }
 
-pub fn render_to_image(image: &mut RasterImage, frame: &FrameView<'_>) {
-    fill_rect(image, 0, 0, frame.width, frame.height, BACKGROUND);
-
-    let layout = layout_grid(frame);
-    stroke_grid_image(image, &layout, GRID);
-
-    for (index, (cell, samples)) in layout
-        .cells
-        .into_iter()
-        .zip(frame.module.channels.iter())
-        .enumerate()
-    {
-        let [x0, _y0, x1, _y1] = cell.rect;
-        let crosshair = vertical_crosshair_rect(cell);
-        fill_rect(
-            image,
-            crosshair[0].max(0.0) as u32,
-            crosshair[1].max(0.0) as u32,
-            (crosshair[2] - crosshair[0]).max(1.0) as u32,
-            (crosshair[3] - crosshair[1]).max(1.0) as u32,
-            CROSSHAIR,
-        );
-
-        let inner_width = ((x1 - x0) - 8.0).max(32.0) as usize;
-        let cursor_samples = ((frame.module.local_time_seconds * frame.module.sample_rate as f64)
-            .round() as usize)
-            .min(samples.len());
-        let trace = ScopeTrace::from_samples(
-            samples,
-            cursor_samples,
-            frame.module.sample_rate,
-            inner_width,
-            frame.max_history_samples,
-        );
-        draw_trace(image, &trace, cell, TRACE);
-
-        if let Some(pan) = frame
-            .module
-            .channel_panning
-            .and_then(|panning| panning.get(index))
-            .copied()
-        {
-            draw_pan_marker_image(image, cell, pan);
-        }
-
-        if let Some(label) = frame
-            .module
-            .channel_labels
-            .and_then(|labels| labels.get(index))
-            .filter(|label| !label.is_empty())
-            .filter(|_| channel_is_active(samples, cursor_samples))
-        {
-            draw_text_image(image, cell, label, TEXT);
-        }
-
-        if let Some(effect) = frame
-            .module
-            .channel_effects
-            .and_then(|effects| effects.get(index))
-            .filter(|effect| !effect.is_empty())
-        {
-            draw_bottom_text_image(image, cell, effect, TEXT);
-        }
-    }
-
-    if let Some(song_info) = frame.module.song_info.filter(|text| !text.is_empty()) {
-        draw_song_info_image(image, frame.width, frame.height, song_info, TEXT);
-    }
-}
-
 pub fn aa_config() -> AaConfig {
     AaConfig::Area
 }
@@ -312,20 +208,6 @@ fn stroke_grid(scene: &mut Scene, layout: &LayoutGrid, rgba: [u8; 4]) {
     }
 }
 
-fn stroke_grid_image(image: &mut RasterImage, layout: &LayoutGrid, rgba: [u8; 4]) {
-    for &[x0, y0, x1, y1] in &layout.edges {
-        let [rx0, ry0, rx1, ry1] = edge_pixel_rect([x0, y0, x1, y1]);
-        fill_rect(
-            image,
-            rx0.max(0.0) as u32,
-            ry0.max(0.0) as u32,
-            (rx1 - rx0).max(1.0) as u32,
-            (ry1 - ry0).max(1.0) as u32,
-            rgba,
-        );
-    }
-}
-
 fn draw_pan_marker_scene(scene: &mut Scene, cell: LayoutCell, pan: f32) {
     let marker = pan_marker_rect(cell, pan);
     let rect = Rect::new(
@@ -337,24 +219,8 @@ fn draw_pan_marker_scene(scene: &mut Scene, cell: LayoutCell, pan: f32) {
     scene.fill(Fill::NonZero, Affine::IDENTITY, color(TRACE), None, &rect);
 }
 
-fn draw_pan_marker_image(image: &mut RasterImage, cell: LayoutCell, pan: f32) {
-    let marker = pan_marker_rect(cell, pan);
-    fill_rect(
-        image,
-        marker[0].max(0.0) as u32,
-        marker[1].max(0.0) as u32,
-        (marker[2] - marker[0]).max(1.0) as u32,
-        (marker[3] - marker[1]).max(1.0) as u32,
-        TRACE,
-    );
-}
-
 fn draw_text_scene(scene: &mut Scene, cell: LayoutCell, text: &str, rgba: [u8; 4]) {
     draw_bitmap_text_scene(scene, cell, text, rgba, text_origin(cell));
-}
-
-fn draw_text_image(image: &mut RasterImage, cell: LayoutCell, text: &str, rgba: [u8; 4]) {
-    draw_bitmap_text_image(image, cell, text, rgba, text_origin(cell));
 }
 
 fn draw_bottom_text_scene(scene: &mut Scene, cell: LayoutCell, text: &str, rgba: [u8; 4]) {
@@ -362,25 +228,9 @@ fn draw_bottom_text_scene(scene: &mut Scene, cell: LayoutCell, text: &str, rgba:
     draw_bitmap_text_scene(scene, cell, text, rgba, origin);
 }
 
-fn draw_bottom_text_image(image: &mut RasterImage, cell: LayoutCell, text: &str, rgba: [u8; 4]) {
-    let origin = bottom_text_origin(cell);
-    draw_bitmap_text_image(image, cell, text, rgba, origin);
-}
-
 fn draw_song_info_scene(scene: &mut Scene, width: u32, height: u32, text: &str, rgba: [u8; 4]) {
     let origin = viewport_bottom_right_text_origin(width, height, text);
     draw_bitmap_text_scene_unbounded(scene, text, rgba, origin);
-}
-
-fn draw_song_info_image(
-    image: &mut RasterImage,
-    width: u32,
-    height: u32,
-    text: &str,
-    rgba: [u8; 4],
-) {
-    let origin = viewport_bottom_right_text_origin(width, height, text);
-    draw_bitmap_text_image_unbounded(image, text, rgba, origin);
 }
 
 fn text_origin(cell: LayoutCell) -> (f32, f32) {
@@ -538,131 +388,6 @@ fn draw_bitmap_text_scene_unbounded(
     }
 }
 
-fn draw_bitmap_text_image(
-    image: &mut RasterImage,
-    cell: LayoutCell,
-    text: &str,
-    rgba: [u8; 4],
-    origin: (f32, f32),
-) {
-    for (index, ch) in text.chars().enumerate() {
-        let glyph_x = origin.0 + index as f32 * 8.0;
-        if glyph_x + 8.0 > cell.rect[2] - 6.0 {
-            break;
-        }
-        let Some(bitmap) = BASIC_FONTS.get(ch) else {
-            continue;
-        };
-        for (row, bits) in bitmap.iter().enumerate() {
-            for col in 0..8 {
-                if (bits >> col) & 1 == 0 {
-                    continue;
-                }
-                put_pixel(
-                    image,
-                    (glyph_x + col as f32).round() as i32,
-                    (origin.1 + row as f32).round() as i32,
-                    rgba,
-                );
-            }
-        }
-    }
-}
-
-fn draw_bitmap_text_image_unbounded(
-    image: &mut RasterImage,
-    text: &str,
-    rgba: [u8; 4],
-    origin: (f32, f32),
-) {
-    for (index, ch) in text.chars().enumerate() {
-        let glyph_x = origin.0 + index as f32 * 8.0;
-        let Some(bitmap) = BASIC_FONTS.get(ch) else {
-            continue;
-        };
-        for (row, bits) in bitmap.iter().enumerate() {
-            for col in 0..8 {
-                if (bits >> col) & 1 == 0 {
-                    continue;
-                }
-                put_pixel(
-                    image,
-                    (glyph_x + col as f32).round() as i32,
-                    (origin.1 + row as f32).round() as i32,
-                    rgba,
-                );
-            }
-        }
-    }
-}
-
-fn draw_trace(image: &mut RasterImage, trace: &ScopeTrace, cell: LayoutCell, rgba: [u8; 4]) {
-    let [x0, y0, x1, y1] = cell.rect;
-    let inner_x0 = x0 + 4.0;
-    let inner_x1 = x1 - 4.0;
-    let center = (y0 + y1) * 0.5;
-    let amplitude = ((y1 - y0) * 0.42).max(1.0);
-
-    let mut previous = None;
-    for &(nx, sample) in &trace.points {
-        let x = inner_x0 + (inner_x1 - inner_x0) * nx.clamp(0.0, 1.0);
-        let y = center - sample * amplitude;
-        let current = (x.round() as i32, y.round() as i32);
-        if let Some((px, py)) = previous {
-            draw_line(image, px, py, current.0, current.1, rgba);
-        }
-        previous = Some(current);
-    }
-}
-
 fn color(rgba: [u8; 4]) -> Color {
     Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
-}
-
-fn fill_rect(image: &mut RasterImage, x: u32, y: u32, width: u32, height: u32, rgba: [u8; 4]) {
-    let max_x = (x + width).min(image.width());
-    let max_y = (y + height).min(image.height());
-    for yy in y..max_y {
-        for xx in x..max_x {
-            image.put_pixel(xx, yy, rgba);
-        }
-    }
-}
-
-fn draw_line(image: &mut RasterImage, mut x0: i32, mut y0: i32, x1: i32, y1: i32, rgba: [u8; 4]) {
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-
-    loop {
-        put_pixel(image, x0, y0, rgba);
-        put_pixel(image, x0 + 1, y0, rgba);
-        put_pixel(image, x0, y0 + 1, rgba);
-
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let twice = err * 2;
-        if twice >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if twice <= dx {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
-fn put_pixel(image: &mut RasterImage, x: i32, y: i32, rgba: [u8; 4]) {
-    if x < 0 || y < 0 {
-        return;
-    }
-    let (x, y) = (x as u32, y as u32);
-    if x >= image.width() || y >= image.height() {
-        return;
-    }
-    image.put_pixel(x, y, rgba);
 }

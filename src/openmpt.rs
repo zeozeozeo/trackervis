@@ -10,8 +10,9 @@ use openmpt_sys::{
     openmpt_module_get_current_row, openmpt_module_get_instrument_name,
     openmpt_module_get_metadata, openmpt_module_get_num_channels,
     openmpt_module_get_num_instruments, openmpt_module_get_num_samples,
-    openmpt_module_get_pattern_row_channel_command, openmpt_module_get_sample_name,
-    openmpt_module_read_interleaved_float_stereo, openmpt_module_set_repeat_count,
+    openmpt_module_get_num_subsongs, openmpt_module_get_pattern_row_channel_command,
+    openmpt_module_get_sample_name, openmpt_module_read_interleaved_float_stereo,
+    openmpt_module_select_subsong, openmpt_module_set_repeat_count,
 };
 
 #[repr(C)]
@@ -87,7 +88,7 @@ pub struct ModuleSource {
 #[derive(Debug, Clone)]
 pub struct ModuleMetadata {
     pub label: String,
-    pub channel_count: usize,
+    pub subsong_count: usize,
 }
 
 pub struct ModuleHandle {
@@ -115,7 +116,7 @@ impl ModuleSource {
         let handle = self.open()?;
         Ok(ModuleMetadata {
             label: handle.display_label(&self.path),
-            channel_count: handle.channel_count(),
+            subsong_count: handle.subsong_count(),
         })
     }
 
@@ -212,11 +213,29 @@ impl ModuleSource {
             channel_count,
         })
     }
+
+    pub fn open_subsong(&self, subsong: usize) -> Result<ModuleHandle> {
+        let mut handle = self.open()?;
+        handle.select_subsong(subsong)?;
+        Ok(handle)
+    }
 }
 
 impl ModuleHandle {
     pub fn channel_count(&self) -> usize {
         self.channel_count
+    }
+
+    pub fn subsong_count(&self) -> usize {
+        unsafe { openmpt_module_get_num_subsongs(self.module) }.max(1) as usize
+    }
+
+    pub fn select_subsong(&mut self, subsong: usize) -> Result<()> {
+        let ok = unsafe { openmpt_module_select_subsong(self.module, subsong as i32) };
+        if ok == 0 {
+            bail!("failed to select subsong {}", subsong + 1);
+        }
+        Ok(())
     }
 
     pub fn display_label(&self, path: &Path) -> String {
@@ -323,81 +342,75 @@ impl ModuleHandle {
         allocated_string(unsafe { openmpt_module_get_sample_name(self.module, index as i32) })
     }
 
-    pub fn pattern_sample_labels(&self, pattern: usize, row: usize) -> Vec<String> {
+    pub fn channel_sample_label(&self, pattern: usize, row: usize, channel: usize) -> String {
+        if channel >= self.channel_count {
+            return String::new();
+        }
         let instrument_count = self.instrument_count();
         let sample_count = self.sample_count();
-        let mut labels = Vec::with_capacity(self.channel_count);
+        let slot = self.pattern_command(
+            pattern,
+            row,
+            channel,
+            openmpt_sys::OPENMPT_MODULE_COMMAND_INSTRUMENT as i32,
+        ) as usize;
+        if slot == 0 {
+            return String::new();
+        }
 
-        for channel in 0..self.channel_count {
-            let slot = self.pattern_command(
+        let display = if instrument_count > 0 {
+            let name = self
+                .instrument_name(slot.saturating_sub(1))
+                .unwrap_or_default();
+            format_label(slot, name)
+        } else if sample_count > 0 {
+            let name = self.sample_name(slot.saturating_sub(1)).unwrap_or_default();
+            format_label(slot, name)
+        } else {
+            String::new()
+        };
+        display.trim_end().to_owned()
+    }
+
+    pub fn channel_effect_label(&self, pattern: usize, row: usize, channel: usize) -> String {
+        if channel >= self.channel_count {
+            return String::new();
+        }
+        let volume = format_compact_effect(
+            self.formatted_pattern_command(
                 pattern,
                 row,
                 channel,
-                openmpt_sys::OPENMPT_MODULE_COMMAND_INSTRUMENT as i32,
-            ) as usize;
-            if slot == 0 {
-                labels.push(String::new());
-                continue;
-            }
+                openmpt_sys::OPENMPT_MODULE_COMMAND_VOLUMEEFFECT as i32,
+            ),
+            self.formatted_pattern_command(
+                pattern,
+                row,
+                channel,
+                openmpt_sys::OPENMPT_MODULE_COMMAND_VOLUME as i32,
+            ),
+        );
+        let effect = format_compact_effect(
+            self.formatted_pattern_command(
+                pattern,
+                row,
+                channel,
+                openmpt_sys::OPENMPT_MODULE_COMMAND_EFFECT as i32,
+            ),
+            self.formatted_pattern_command(
+                pattern,
+                row,
+                channel,
+                openmpt_sys::OPENMPT_MODULE_COMMAND_PARAMETER as i32,
+            ),
+        );
 
-            let display = if instrument_count > 0 {
-                let name = self
-                    .instrument_name(slot.saturating_sub(1))
-                    .unwrap_or_default();
-                format_label(slot, name)
-            } else if sample_count > 0 {
-                let name = self.sample_name(slot.saturating_sub(1)).unwrap_or_default();
-                format_label(slot, name)
-            } else {
-                String::new()
-            };
-            labels.push(display.trim_end().to_owned());
+        match (volume.is_empty(), effect.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => volume,
+            (true, false) => effect,
+            (false, false) => format!("{volume} {effect}"),
         }
-
-        labels
-    }
-
-    pub fn pattern_effect_labels(&self, pattern: usize, row: usize) -> Vec<String> {
-        let mut labels = Vec::with_capacity(self.channel_count);
-        for channel in 0..self.channel_count {
-            let volume = format_compact_effect(
-                self.formatted_pattern_command(
-                    pattern,
-                    row,
-                    channel,
-                    openmpt_sys::OPENMPT_MODULE_COMMAND_VOLUMEEFFECT as i32,
-                ),
-                self.formatted_pattern_command(
-                    pattern,
-                    row,
-                    channel,
-                    openmpt_sys::OPENMPT_MODULE_COMMAND_VOLUME as i32,
-                ),
-            );
-            let effect = format_compact_effect(
-                self.formatted_pattern_command(
-                    pattern,
-                    row,
-                    channel,
-                    openmpt_sys::OPENMPT_MODULE_COMMAND_EFFECT as i32,
-                ),
-                self.formatted_pattern_command(
-                    pattern,
-                    row,
-                    channel,
-                    openmpt_sys::OPENMPT_MODULE_COMMAND_PARAMETER as i32,
-                ),
-            );
-
-            let label = match (volume.is_empty(), effect.is_empty()) {
-                (true, true) => String::new(),
-                (false, true) => volume,
-                (true, false) => effect,
-                (false, false) => format!("{volume} {effect}"),
-            };
-            labels.push(label);
-        }
-        labels
     }
 
     pub fn channel_panning(&self, channel: usize) -> Option<f32> {
@@ -445,6 +458,29 @@ impl Drop for ModuleHandle {
         unsafe {
             openmpt_module_ext_destroy(self.ext_module);
         }
+    }
+}
+
+pub fn snapshot_isolated_channel_annotations(
+    isolated: &[ModuleHandle],
+    labels: &mut Vec<String>,
+    effects: &mut Vec<String>,
+) {
+    if labels.len() < isolated.len() {
+        labels.resize(isolated.len(), String::new());
+    }
+    if effects.len() < isolated.len() {
+        effects.resize(isolated.len(), String::new());
+    }
+
+    for (channel, handle) in isolated.iter().enumerate() {
+        let pattern = handle.current_pattern();
+        let row = handle.current_row();
+        let label = handle.channel_sample_label(pattern, row, channel);
+        if !label.is_empty() {
+            labels[channel] = label;
+        }
+        effects[channel] = handle.channel_effect_label(pattern, row, channel);
     }
 }
 

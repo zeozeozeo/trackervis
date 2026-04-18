@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
+[lib]
+name = "trackervis_web"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 anyhow = "1.0"
 font8x8 = "0.3"
+vello = "0.8"
+winit = "0.30"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -16,9 +22,33 @@ openmpt-sys = "0.2"
 parking_lot = "0.12"
 pollster = "0.4"
 tempfile = "3.15"
-vello = "0.8"
 walkdir = "2.5"
-winit = "0.30"
+rayon = "1.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+rfd = "0.15"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioContext",
+    "AudioContextState",
+    "AudioDestinationNode",
+    "AudioNode",
+    "BaseAudioContext",
+    "console",
+    "Document",
+    "Element",
+    "EventTarget",
+    "File",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Performance",
+    "Window",
+] }
 
 [build-dependencies]
 pkg-config = "0.3"

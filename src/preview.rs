@@ -4,8 +4,6 @@ use anyhow::{Context, Result};
 use cpal::BufferSize;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
-use vello::util::{RenderContext, RenderSurface};
-use vello::{RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -15,9 +13,11 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::cli::{PreviewArgs, SortOrder};
 use crate::discover;
-use crate::openmpt::{ModuleHandle, ModuleSource};
+use crate::openmpt::{ModuleHandle, ModuleSource, snapshot_isolated_channel_annotations};
 use crate::oscilloscope::SampleHistory;
-use crate::visualizer::{FrameModule, FrameView, aa_config, render_to_scene};
+use crate::playlist::{PlaylistEntry, expand_sources};
+use crate::render_host::VelloSurfaceRenderer;
+use crate::visualizer::{FrameModule, FrameView};
 
 pub fn run(args: PreviewArgs) -> Result<()> {
     let items = discover::discover(&args.input.inputs, args.input.sort, args.input.recursive)?;
@@ -25,6 +25,7 @@ pub fn run(args: PreviewArgs) -> Result<()> {
         .iter()
         .map(|item| ModuleSource::load(&item.path))
         .collect::<Result<Vec<_>>>()?;
+    let playlist = expand_sources(sources)?;
 
     let host = cpal::default_host();
     let device = host
@@ -45,7 +46,7 @@ pub fn run(args: PreviewArgs) -> Result<()> {
         args.show_song_info,
     )));
     let engine = Arc::new(Mutex::new(AudioEngine::new(
-        sources,
+        playlist,
         sample_rate,
         output_channels,
         Arc::clone(&shared),
@@ -129,7 +130,7 @@ struct PreviewApp {
     sort: SortOrder,
     recursive: bool,
     window: Option<&'static Window>,
-    renderer: Option<PreviewRenderer>,
+    renderer: Option<VelloSurfaceRenderer>,
 }
 
 impl PreviewApp {
@@ -166,8 +167,11 @@ impl ApplicationHandler for PreviewApp {
             )
             .expect("failed to create window");
         let window = Box::leak(Box::new(window));
-        let renderer =
-            pollster::block_on(PreviewRenderer::new(window)).expect("renderer init failed");
+        let renderer = pollster::block_on(VelloSurfaceRenderer::new(
+            window,
+            vello::wgpu::PresentMode::AutoNoVsync,
+        ))
+        .expect("renderer init failed");
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -248,94 +252,6 @@ impl ApplicationHandler for PreviewApp {
     }
 }
 
-struct PreviewRenderer {
-    render_context: RenderContext,
-    surface: RenderSurface<'static>,
-    renderer: Renderer,
-    scene: Scene,
-    size: PhysicalSize<u32>,
-}
-
-impl PreviewRenderer {
-    async fn new(window: &'static Window) -> Result<Self> {
-        let mut render_context = RenderContext::new();
-        let size = window.inner_size();
-        let surface = render_context
-            .create_surface(
-                window,
-                size.width.max(1),
-                size.height.max(1),
-                vello::wgpu::PresentMode::AutoNoVsync,
-            )
-            .await
-            .context("failed to create render surface")?;
-        let device = &render_context.devices[surface.dev_id].device;
-        let renderer = Renderer::new(device, RendererOptions::default())
-            .context("failed to create vello renderer")?;
-
-        Ok(Self {
-            render_context,
-            surface,
-            renderer,
-            scene: Scene::new(),
-            size,
-        })
-    }
-
-    fn resize(&mut self, size: PhysicalSize<u32>) {
-        self.size = size;
-        if size.width > 0 && size.height > 0 {
-            self.render_context
-                .resize_surface(&mut self.surface, size.width, size.height);
-        }
-    }
-
-    fn render(&mut self, frame: &FrameView) -> Result<()> {
-        if self.size.width == 0 || self.size.height == 0 {
-            return Ok(());
-        }
-        let device_handle = &self.render_context.devices[self.surface.dev_id];
-        render_to_scene(&mut self.scene, frame);
-
-        self.renderer.render_to_texture(
-            &device_handle.device,
-            &device_handle.queue,
-            &self.scene,
-            &self.surface.target_view,
-            &RenderParams {
-                base_color: vello::peniko::Color::BLACK,
-                width: self.size.width,
-                height: self.size.height,
-                antialiasing_method: aa_config(),
-            },
-        )?;
-
-        let surface_texture = self
-            .surface
-            .surface
-            .get_current_texture()
-            .context("failed to acquire swapchain texture")?;
-        let surface_view = surface_texture
-            .texture
-            .create_view(&vello::wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            device_handle
-                .device
-                .create_command_encoder(&vello::wgpu::CommandEncoderDescriptor {
-                    label: Some("trackervis-preview"),
-                });
-        self.surface.blitter.copy(
-            &device_handle.device,
-            &mut encoder,
-            &self.surface.target_view,
-            &surface_view,
-        );
-        device_handle.queue.submit(Some(encoder.finish()));
-        surface_texture.present();
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PreviewVisualState {
     label: String,
@@ -382,7 +298,7 @@ struct PlaybackState {
 }
 
 struct AudioEngine {
-    playlist: Vec<ModuleSource>,
+    playlist: Vec<PlaylistEntry>,
     current_index: usize,
     current: Option<PlaybackState>,
     paused: bool,
@@ -396,7 +312,7 @@ struct AudioEngine {
 
 impl AudioEngine {
     fn new(
-        playlist: Vec<ModuleSource>,
+        playlist: Vec<PlaylistEntry>,
         sample_rate: u32,
         output_channels: usize,
         shared: Arc<Mutex<PreviewVisualState>>,
@@ -467,14 +383,10 @@ impl AudioEngine {
                 }
 
                 current.channel_panning = current.master.channel_panning_snapshot();
-                let labels = current.master.pattern_sample_labels(
-                    current.master.current_pattern(),
-                    current.master.current_row(),
-                );
-                merge_channel_labels(&mut current.channel_labels, labels);
-                current.channel_effects = current.master.pattern_effect_labels(
-                    current.master.current_pattern(),
-                    current.master.current_row(),
+                snapshot_isolated_channel_annotations(
+                    &current.isolated,
+                    &mut current.channel_labels,
+                    &mut current.channel_effects,
                 );
                 current.local_time_seconds += rendered as f64 / self.sample_rate as f64;
                 self.frames_since_snapshot += rendered;
@@ -524,11 +436,11 @@ impl AudioEngine {
         recursive: bool,
     ) -> Result<()> {
         let items = discover::discover(inputs, sort, recursive)?;
-        let playlist = items
+        let sources = items
             .iter()
             .map(|item| ModuleSource::load(&item.path))
             .collect::<Result<Vec<_>>>()?;
-        self.playlist = playlist;
+        self.playlist = expand_sources(sources)?;
         self.current_index = 0;
         self.current = None;
         self.paused = false;
@@ -539,20 +451,15 @@ impl AudioEngine {
         if self.playlist.is_empty() {
             anyhow::bail!("playlist is empty");
         }
-        let source = &self.playlist[self.current_index];
-        let master = source.open()?;
+        let entry = &self.playlist[self.current_index];
+        let master = entry.source.open_subsong(entry.subsong_index)?;
         let channel_count = master.channel_count().max(1);
-        let label = master.display_label(&source.path);
-        let filename = source
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        let song_info = format_song_info(self.current_index, self.playlist.len(), &label);
+        let label = entry.label.clone();
+        let filename = entry.filename.clone();
+        let song_info = format_song_info(entry.playlist_index, entry.playlist_len, &label);
         let mut isolated = Vec::with_capacity(channel_count);
         for channel in 0..channel_count {
-            let mut handle = source.open()?;
+            let mut handle = entry.source.open_subsong(entry.subsong_index)?;
             handle.mute_all_except(channel)?;
             isolated.push(handle);
         }
@@ -575,14 +482,10 @@ impl AudioEngine {
         });
         if let Some(current) = &mut self.current {
             current.channel_panning = current.master.channel_panning_snapshot();
-            let labels = current.master.pattern_sample_labels(
-                current.master.current_pattern(),
-                current.master.current_row(),
-            );
-            merge_channel_labels(&mut current.channel_labels, labels);
-            current.channel_effects = current.master.pattern_effect_labels(
-                current.master.current_pattern(),
-                current.master.current_row(),
+            snapshot_isolated_channel_annotations(
+                &current.isolated,
+                &mut current.channel_labels,
+                &mut current.channel_effects,
             );
         }
         {
@@ -620,17 +523,6 @@ impl AudioEngine {
         shared.channel_panning = current.channel_panning.clone();
         shared.channel_labels = current.channel_labels.clone();
         shared.channel_effects = current.channel_effects.clone();
-    }
-}
-
-fn merge_channel_labels(slots: &mut Vec<String>, updates: Vec<String>) {
-    if slots.len() < updates.len() {
-        slots.resize(updates.len(), String::new());
-    }
-    for (index, update) in updates.into_iter().enumerate() {
-        if !update.is_empty() {
-            slots[index] = update;
-        }
     }
 }
 

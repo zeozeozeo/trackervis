@@ -11,7 +11,11 @@ mod openmpt;
 #[cfg(not(target_arch = "wasm32"))]
 mod oscilloscope;
 #[cfg(not(target_arch = "wasm32"))]
+mod playlist;
+#[cfg(not(target_arch = "wasm32"))]
 mod preview;
+#[cfg(not(target_arch = "wasm32"))]
+mod render_host;
 #[cfg(not(target_arch = "wasm32"))]
 mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,5 +39,7 @@ fn main() -> Result<()> {
 
 #[cfg(target_arch = "wasm32")]
 fn main() -> Result<()> {
-    anyhow::bail!("todooooo")
+    anyhow::bail!(
+        "the browser build is not implemented in this binary yet; split the app into a native CLI and a wasm frontend"
+    )
 }
