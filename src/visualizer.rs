@@ -55,11 +55,10 @@ pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>) {
     );
 
     let layout = layout_grid(frame);
-    stroke_grid(scene, &layout, GRID);
 
     for (index, (cell, samples)) in layout
         .cells
-        .into_iter()
+        .iter()
         .zip(frame.module.channels.iter())
         .enumerate()
     {
@@ -89,7 +88,7 @@ pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>) {
             inner_width,
             frame.max_history_samples,
         );
-        let path = scope_path(&trace, cell);
+        let path = scope_path(&trace, &cell);
         scene.stroke(
             &Stroke::new(1.5),
             Affine::IDENTITY,
@@ -126,6 +125,8 @@ pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>) {
             draw_bottom_text_scene(scene, cell, effect, TEXT);
         }
     }
+    
+    stroke_grid(scene, &layout, GRID);
 
     if let Some(song_info) = frame.module.song_info.filter(|text| !text.is_empty()) {
         draw_song_info_scene(scene, frame.width, frame.height, song_info, TEXT);
@@ -180,7 +181,7 @@ fn layout_grid(frame: &FrameView<'_>) -> LayoutGrid {
     LayoutGrid { cells, edges }
 }
 
-fn scope_path(trace: &ScopeTrace, cell: LayoutCell) -> BezPath {
+fn scope_path(trace: &ScopeTrace, cell: &LayoutCell) -> BezPath {
     let [x0, y0, x1, y1] = cell.rect;
     let inner_x0 = x0 + 4.0;
     let inner_x1 = x1 - 4.0;
@@ -208,7 +209,7 @@ fn stroke_grid(scene: &mut Scene, layout: &LayoutGrid, rgba: [u8; 4]) {
     }
 }
 
-fn draw_pan_marker_scene(scene: &mut Scene, cell: LayoutCell, pan: f32) {
+fn draw_pan_marker_scene(scene: &mut Scene, cell: &LayoutCell, pan: f32) {
     let marker = pan_marker_rect(cell, pan);
     let rect = Rect::new(
         marker[0] as f64,
@@ -219,11 +220,11 @@ fn draw_pan_marker_scene(scene: &mut Scene, cell: LayoutCell, pan: f32) {
     scene.fill(Fill::NonZero, Affine::IDENTITY, color(TRACE), None, &rect);
 }
 
-fn draw_text_scene(scene: &mut Scene, cell: LayoutCell, text: &str, rgba: [u8; 4]) {
+fn draw_text_scene(scene: &mut Scene, cell: &LayoutCell, text: &str, rgba: [u8; 4]) {
     draw_bitmap_text_scene(scene, cell, text, rgba, text_origin(cell));
 }
 
-fn draw_bottom_text_scene(scene: &mut Scene, cell: LayoutCell, text: &str, rgba: [u8; 4]) {
+fn draw_bottom_text_scene(scene: &mut Scene, cell: &LayoutCell, text: &str, rgba: [u8; 4]) {
     let origin = bottom_text_origin(cell);
     draw_bitmap_text_scene(scene, cell, text, rgba, origin);
 }
@@ -233,11 +234,11 @@ fn draw_song_info_scene(scene: &mut Scene, width: u32, height: u32, text: &str, 
     draw_bitmap_text_scene_unbounded(scene, text, rgba, origin);
 }
 
-fn text_origin(cell: LayoutCell) -> (f32, f32) {
+fn text_origin(cell: &LayoutCell) -> (f32, f32) {
     (cell.rect[0] + 6.0, cell.rect[1] + 6.0)
 }
 
-fn bottom_text_origin(cell: LayoutCell) -> (f32, f32) {
+fn bottom_text_origin(cell: &LayoutCell) -> (f32, f32) {
     (cell.rect[0] + 6.0, cell.rect[3] - 14.0)
 }
 
@@ -248,7 +249,7 @@ fn viewport_bottom_right_text_origin(width: u32, height: u32, text: &str) -> (f3
     (x, y)
 }
 
-fn pan_marker_rect(cell: LayoutCell, pan: f32) -> [f32; 4] {
+fn pan_marker_rect(cell: &LayoutCell, pan: f32) -> [f32; 4] {
     let [x0, _y0, x1, y1] = cell.rect;
     let marker = 6.0f32;
     let margin = 8.0f32;
@@ -286,7 +287,7 @@ fn cell_edges(cell: LayoutCell) -> [[f32; 4]; 4] {
     ]
 }
 
-fn vertical_crosshair_rect(cell: LayoutCell) -> [f32; 4] {
+fn vertical_crosshair_rect(cell: &LayoutCell) -> [f32; 4] {
     let [x0, y0, x1, y1] = cell.rect;
     let center = ((x0 + x1) * 0.5).floor().clamp(x0, (x1 - 1.0).max(x0));
     [center, y0, center + 1.0, y1]
@@ -334,7 +335,7 @@ fn channel_is_active(samples: &[f32], cursor_samples: usize) -> bool {
 
 fn draw_bitmap_text_scene(
     scene: &mut Scene,
-    cell: LayoutCell,
+    cell: &LayoutCell,
     text: &str,
     rgba: [u8; 4],
     origin: (f32, f32),
