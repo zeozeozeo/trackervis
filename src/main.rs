@@ -1,4 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(not(target_arch = "wasm32"))]
 mod chapters;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli;
@@ -40,6 +44,6 @@ fn main() -> Result<()> {
 #[cfg(target_arch = "wasm32")]
 fn main() -> Result<()> {
     anyhow::bail!(
-        "the browser build is not implemented in this binary yet; split the app into a native CLI and a wasm frontend"
+        "wasm binary?"
     )
 }
