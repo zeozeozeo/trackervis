@@ -2,10 +2,12 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use openmpt_sys::{
-    openmpt_error_func, openmpt_free_string, openmpt_log_func, openmpt_module,
+    openmpt_error_func, openmpt_free_string, openmpt_get_supported_extensions, openmpt_log_func,
+    openmpt_module,
     openmpt_module_format_pattern_row_channel_command, openmpt_module_get_current_pattern,
     openmpt_module_get_current_row, openmpt_module_get_instrument_name,
     openmpt_module_get_metadata, openmpt_module_get_num_channels,
@@ -79,6 +81,8 @@ unsafe extern "C" {
 const INTERACTIVE_ID: &[u8] = b"interactive\0";
 const INTERACTIVE2_ID: &[u8] = b"interactive2\0";
 
+static SUPPORTED_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
+
 #[derive(Debug, Clone)]
 pub struct ModuleSource {
     pub path: PathBuf,
@@ -101,6 +105,10 @@ pub struct ModuleHandle {
 }
 
 unsafe impl Send for ModuleHandle {}
+
+pub fn supported_extensions() -> &'static [String] {
+    SUPPORTED_EXTENSIONS.get_or_init(load_supported_extensions).as_slice()
+}
 
 impl ModuleSource {
     pub fn load(path: &Path) -> Result<Self> {
@@ -530,3 +538,36 @@ fn format_compact_effect(kind: String, value: String) -> String {
         (false, false) => format!("{kind}{value}"),
     }
 }
+
+fn load_supported_extensions() -> Vec<String> {
+    let ptr = unsafe { openmpt_get_supported_extensions() };
+    if ptr.is_null() {
+        return fallback_supported_extensions();
+    }
+
+    let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+    let extensions = text
+        .split(';')
+        .map(str::trim)
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    if extensions.is_empty() {
+        fallback_supported_extensions()
+    } else {
+        extensions
+    }
+}
+
+fn fallback_supported_extensions() -> Vec<String> {
+    FALLBACK_SUPPORTED_EXTENSIONS
+        .iter()
+        .map(|extension| (*extension).to_owned())
+        .collect()
+}
+
+const FALLBACK_SUPPORTED_EXTENSIONS: &[&str] = &[
+    "669", "amf", "ams", "dbm", "digi", "dmf", "far", "gdm", "imf", "it", "med", "mod", "mt2",
+    "mtm", "mptm", "okt", "psm", "s3m", "stm", "ult", "umx", "xm",
+];

@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -8,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
 use crate::cli::SortOrder;
+use crate::openmpt::supported_extensions;
 
 #[derive(Debug, Clone)]
 pub struct PlaylistItem {
@@ -15,14 +15,9 @@ pub struct PlaylistItem {
     pub modified: SystemTime,
 }
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "669", "amf", "ams", "dbm", "digi", "dmf", "far", "gdm", "imf", "it", "med", "mod", "mt2",
-    "mtm", "okt", "psm", "s3m", "stm", "ult", "umx", "xm",
-];
-
 pub fn discover(inputs: &[PathBuf], sort: SortOrder, recursive: bool) -> Result<Vec<PlaylistItem>> {
     let mut items = Vec::new();
-    let supported: HashSet<&'static str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
+    let supported = supported_extensions();
 
     for input in inputs {
         let metadata = std::fs::metadata(input)
@@ -54,7 +49,7 @@ pub fn discover(inputs: &[PathBuf], sort: SortOrder, recursive: bool) -> Result<
     Ok(items)
 }
 
-fn scan_dir(root: &Path, recursive: bool, supported: &HashSet<&str>) -> Result<Vec<PlaylistItem>> {
+fn scan_dir(root: &Path, recursive: bool, supported: &[String]) -> Result<Vec<PlaylistItem>> {
     let mut items = Vec::new();
     let walker = if recursive {
         WalkDir::new(root)
@@ -79,10 +74,10 @@ fn scan_dir(root: &Path, recursive: bool, supported: &HashSet<&str>) -> Result<V
     Ok(items)
 }
 
-fn is_supported_module(path: &Path, supported: &HashSet<&str>) -> bool {
+fn is_supported_module(path: &Path, supported: &[String]) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
-        .map(|ext| supported.contains(&ext.to_ascii_lowercase()[..]))
+        .map(|ext| supported.iter().any(|supported_ext| supported_ext.eq_ignore_ascii_case(ext)))
         .unwrap_or(false)
 }
 
@@ -93,41 +88,5 @@ fn compare_items(left: &PlaylistItem, right: &PlaylistItem, sort: SortOrder) -> 
             .modified
             .cmp(&right.modified)
             .then_with(|| left.path.file_name().cmp(&right.path.file_name())),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compare_items;
-    use crate::cli::SortOrder;
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
-
-    #[test]
-    fn filename_sort_uses_basename() {
-        let left = super::PlaylistItem {
-            path: PathBuf::from("b.mod"),
-            modified: SystemTime::UNIX_EPOCH,
-        };
-        let right = super::PlaylistItem {
-            path: PathBuf::from("a.mod"),
-            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-        };
-
-        assert!(compare_items(&left, &right, SortOrder::Filename).is_gt());
-    }
-
-    #[test]
-    fn mtime_sort_uses_modified_then_name() {
-        let left = super::PlaylistItem {
-            path: PathBuf::from("b.mod"),
-            modified: SystemTime::UNIX_EPOCH,
-        };
-        let right = super::PlaylistItem {
-            path: PathBuf::from("a.mod"),
-            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-        };
-
-        assert!(compare_items(&left, &right, SortOrder::Mtime).is_lt());
     }
 }

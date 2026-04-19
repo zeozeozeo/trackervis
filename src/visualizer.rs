@@ -52,6 +52,7 @@ impl RenderScratch {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct LayoutGrid {
     edges: Vec<[f32; 4]>,
@@ -298,6 +299,7 @@ fn render_scope_trace_scene(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn layout_grid(frame: &FrameView<'_>) -> LayoutGrid {
     let count = frame.module.channels.len().max(1);
     let cols = ((count as f64 * frame.width as f64 / frame.height as f64)
