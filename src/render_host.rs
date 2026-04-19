@@ -4,7 +4,7 @@ use vello::{RenderParams, Renderer, RendererOptions, Scene};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use crate::visualizer::{FrameView, aa_config, render_to_scene};
+use crate::visualizer::{FrameView, RenderScratch, aa_config, render_to_scene};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
@@ -14,6 +14,7 @@ pub struct VelloSurfaceRenderer {
     surface: RenderSurface<'static>,
     renderer: Renderer,
     scene: Scene,
+    scratch: RenderScratch,
     pub size: PhysicalSize<u32>,
 }
 
@@ -37,6 +38,7 @@ impl VelloSurfaceRenderer {
             surface,
             renderer,
             scene: Scene::new(),
+            scratch: RenderScratch::new(),
             size,
         })
     }
@@ -55,7 +57,7 @@ impl VelloSurfaceRenderer {
         }
 
         let device_handle = &self.render_context.devices[self.surface.dev_id];
-        render_to_scene(&mut self.scene, frame);
+        render_to_scene(&mut self.scene, frame, &mut self.scratch);
         self.renderer
             .render_to_texture(
                 &device_handle.device,
@@ -103,6 +105,7 @@ pub struct VelloImageRenderer {
     device_id: usize,
     renderer: Renderer,
     scene: Scene,
+    scratch: RenderScratch,
     target_texture: vello::wgpu::Texture,
     target_view: vello::wgpu::TextureView,
     readback: ReadbackBuffer,
@@ -136,6 +139,7 @@ impl VelloImageRenderer {
             device_id: dev_id,
             renderer,
             scene: Scene::new(),
+            scratch: RenderScratch::new(),
             target_texture,
             target_view,
             readback,
@@ -159,15 +163,31 @@ impl VelloImageRenderer {
         self.readback = readback;
     }
 
+    #[allow(dead_code)]
     pub fn render(&mut self, frame: &FrameView<'_>) -> Result<Vec<u8>> {
+        let mut pixels = vec![0u8; frame.width.max(1) as usize * frame.height.max(1) as usize * 4];
+        self.render_into(frame, pixels.as_mut_slice())?;
+        Ok(pixels)
+    }
+
+    pub fn render_into(&mut self, frame: &FrameView<'_>, out: &mut [u8]) -> Result<()> {
         let width = frame.width.max(1);
         let height = frame.height.max(1);
         if self.size.width != width || self.size.height != height {
             self.resize(width, height);
         }
 
+        let expected_len = width as usize * height as usize * 4;
+        if out.len() != expected_len {
+            return Err(anyhow!(
+                "output buffer has length {}, expected {}",
+                out.len(),
+                expected_len
+            ));
+        }
+
         let device_handle = &self.render_context.devices[self.device_id];
-        render_to_scene(&mut self.scene, frame);
+        render_to_scene(&mut self.scene, frame, &mut self.scratch);
         self.renderer
             .render_to_texture(
                 &device_handle.device,
@@ -183,13 +203,14 @@ impl VelloImageRenderer {
             )
             .map_err(|error| anyhow!("failed to render vello scene: {error:?}"))?;
 
-        readback_rgba(
+        readback_rgba_into(
             &device_handle.device,
             &device_handle.queue,
             &self.target_texture,
             &self.readback,
             width,
             height,
+            out,
         )
     }
 }
@@ -241,6 +262,7 @@ fn create_offscreen_targets(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn readback_rgba(
     device: &vello::wgpu::Device,
     queue: &vello::wgpu::Queue,
@@ -249,6 +271,30 @@ fn readback_rgba(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>> {
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    readback_rgba_into(device, queue, texture, readback, width, height, pixels.as_mut_slice())?;
+    Ok(pixels)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn readback_rgba_into(
+    device: &vello::wgpu::Device,
+    queue: &vello::wgpu::Queue,
+    texture: &vello::wgpu::Texture,
+    readback: &ReadbackBuffer,
+    width: u32,
+    height: u32,
+    out: &mut [u8],
+) -> Result<()> {
+    let expected_len = width as usize * height as usize * 4;
+    if out.len() != expected_len {
+        return Err(anyhow!(
+            "output buffer has length {}, expected {}",
+            out.len(),
+            expected_len
+        ));
+    }
+
     let mut encoder = device.create_command_encoder(&vello::wgpu::CommandEncoderDescriptor {
         label: Some("trackervis-offscreen-readback"),
     });
@@ -286,17 +332,16 @@ fn readback_rgba(
         .map_err(|error| anyhow!("failed to map readback buffer: {error:?}"))?;
 
     let mapped = readback.buffer.slice(..).get_mapped_range();
-    let mut pixels = vec![0u8; width as usize * height as usize * 4];
     for (row_index, src_row) in mapped
         .chunks_exact(readback.padded_bytes_per_row as usize)
         .enumerate()
         .take(height as usize)
     {
         let dst_offset = row_index * readback.row_bytes;
-        pixels[dst_offset..dst_offset + readback.row_bytes]
+        out[dst_offset..dst_offset + readback.row_bytes]
             .copy_from_slice(&src_row[..readback.row_bytes]);
     }
     drop(mapped);
     readback.buffer.unmap();
-    Ok(pixels)
+    Ok(())
 }

@@ -1,11 +1,7 @@
-use std::collections::HashSet;
-
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use vello::kurbo::{Affine, BezPath, Point, Rect, Stroke};
 use vello::peniko::{Color, Fill};
 use vello::{AaConfig, Scene};
-
-use crate::oscilloscope::ScopeTrace;
 
 #[derive(Debug, Clone)]
 pub struct FrameModule<'a> {
@@ -31,9 +27,33 @@ struct LayoutCell {
     rect: [f32; 4],
 }
 
+#[derive(Debug, Default)]
+pub struct RenderScratch {
+    trace_path: BezPath,
+    trace_path_capacity: usize,
+    trace_samples: Vec<f32>,
+}
+
+impl RenderScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn ensure_scope_capacity(&mut self, points: usize) {
+        let points = points.max(2);
+        if self.trace_samples.capacity() < points {
+            self.trace_samples = Vec::with_capacity(points);
+        }
+        if self.trace_path_capacity < points {
+            self.trace_path = BezPath::with_capacity(points);
+            self.trace_path_capacity = points;
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct LayoutGrid {
-    cells: Vec<LayoutCell>,
     edges: Vec<[f32; 4]>,
 }
 
@@ -43,7 +63,7 @@ const CROSSHAIR: [u8; 4] = [112, 112, 112, 255];
 const TRACE: [u8; 4] = [255, 255, 255, 255];
 const TEXT: [u8; 4] = [255, 255, 255, 255];
 
-pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>) {
+pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>, scratch: &mut RenderScratch) {
     scene.reset();
     let background = Rect::new(0.0, 0.0, frame.width as f64, frame.height as f64);
     scene.fill(
@@ -54,79 +74,60 @@ pub fn render_to_scene(scene: &mut Scene, frame: &FrameView<'_>) {
         &background,
     );
 
-    let layout = layout_grid(frame);
+    let channel_count = frame.module.channels.len();
+    let layout_count = channel_count.max(1);
+    let cols = ((layout_count as f64 * frame.width as f64 / frame.height as f64)
+        .sqrt()
+        .ceil() as usize)
+        .max(1);
+    let rows = layout_count.div_ceil(cols);
+    let base_cols_per_row = layout_count / rows;
+    let extra = layout_count % rows;
+    scratch.ensure_scope_capacity(frame.width.max(32) as usize);
 
-    for (index, (cell, samples)) in layout
-        .cells
-        .iter()
-        .zip(frame.module.channels.iter())
-        .enumerate()
-    {
-        let [x0, _y0, x1, _y1] = cell.rect;
-        let crosshair = vertical_crosshair_rect(cell);
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            color(CROSSHAIR),
-            None,
-            &Rect::new(
-                crosshair[0] as f64,
-                crosshair[1] as f64,
-                crosshair[2] as f64,
-                crosshair[3] as f64,
-            ),
-        );
-
-        let inner_width = ((x1 - x0) - 8.0).max(32.0) as usize;
-        let cursor_samples = ((frame.module.local_time_seconds * frame.module.sample_rate as f64)
-            .round() as usize)
-            .min(samples.len());
-        let trace = ScopeTrace::from_samples(
-            samples,
-            cursor_samples,
-            frame.module.sample_rate,
-            inner_width,
-            frame.max_history_samples,
-        );
-        let path = scope_path(&trace, &cell);
-        scene.stroke(
-            &Stroke::new(1.5),
-            Affine::IDENTITY,
-            color(TRACE),
-            None,
-            &path,
-        );
-
-        if let Some(pan) = frame
-            .module
-            .channel_panning
-            .and_then(|panning| panning.get(index))
-            .copied()
-        {
-            draw_pan_marker_scene(scene, cell, pan);
+    let mut channel_index = 0usize;
+    for row in 0..rows {
+        let cols_in_row = base_cols_per_row + usize::from(row < extra);
+        if cols_in_row == 0 {
+            continue;
         }
 
-        if let Some(label) = frame
-            .module
-            .channel_labels
-            .and_then(|labels| labels.get(index))
-            .filter(|label| !label.is_empty())
-            .filter(|_| channel_is_active(samples, cursor_samples))
-        {
-            draw_text_scene(scene, cell, label, TEXT);
-        }
-
-        if let Some(effect) = frame
-            .module
-            .channel_effects
-            .and_then(|effects| effects.get(index))
-            .filter(|effect| !effect.is_empty())
-        {
-            draw_bottom_text_scene(scene, cell, effect, TEXT);
+        let y0 = axis_bound(frame.height, rows, row);
+        let y1 = axis_bound(frame.height, rows, row + 1);
+        for col in 0..cols_in_row {
+            let x0 = axis_bound(frame.width, cols_in_row, col);
+            let x1 = axis_bound(frame.width, cols_in_row, col + 1);
+            let cell = LayoutCell {
+                rect: [x0, y0, x1, y1],
+            };
+            if let Some(samples) = frame.module.channels.get(channel_index) {
+                draw_cell_scene(scene, frame, &cell, samples, channel_index, scratch);
+                channel_index += 1;
+            }
         }
     }
-    
-    stroke_grid(scene, &layout, GRID);
+
+    for row in 0..rows {
+        let cols_in_row = base_cols_per_row + usize::from(row < extra);
+        if cols_in_row == 0 {
+            continue;
+        }
+
+        let y0 = axis_bound(frame.height, rows, row);
+        let y1 = axis_bound(frame.height, rows, row + 1);
+        if row + 1 < rows {
+            let rect = edge_rect([0.5, y1 - 0.5, frame.width as f32 - 0.5, y1 - 0.5]);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, color(GRID), None, &rect);
+        }
+
+        for col in 0..cols_in_row {
+            let x0 = axis_bound(frame.width, cols_in_row, col);
+            if col > 0 {
+                let rect = edge_rect([x0 - 0.5, y0 - 0.5, x0 - 0.5, y1 - 0.5]);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, color(GRID), None, &rect);
+            }
+        }
+    }
 
     if let Some(song_info) = frame.module.song_info.filter(|text| !text.is_empty()) {
         draw_song_info_scene(scene, frame.width, frame.height, song_info, TEXT);
@@ -137,6 +138,166 @@ pub fn aa_config() -> AaConfig {
     AaConfig::Area
 }
 
+fn draw_cell_scene(
+    scene: &mut Scene,
+    frame: &FrameView<'_>,
+    cell: &LayoutCell,
+    samples: &[f32],
+    index: usize,
+    scratch: &mut RenderScratch,
+) {
+    let [x0, _y0, x1, _y1] = cell.rect;
+    let crosshair = vertical_crosshair_rect(cell);
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        color(CROSSHAIR),
+        None,
+        &Rect::new(
+            crosshair[0] as f64,
+            crosshair[1] as f64,
+            crosshair[2] as f64,
+            crosshair[3] as f64,
+        ),
+    );
+
+    let inner_width = ((x1 - x0) - 8.0).max(32.0) as usize;
+    let cursor_samples = ((frame.module.local_time_seconds * frame.module.sample_rate as f64)
+        .round() as usize)
+        .min(samples.len());
+    render_scope_trace_scene(
+        scene,
+        samples,
+        cursor_samples,
+        frame.module.sample_rate,
+        frame.max_history_samples,
+        cell,
+        inner_width,
+        scratch,
+    );
+
+    if let Some(pan) = frame
+        .module
+        .channel_panning
+        .and_then(|panning| panning.get(index))
+        .copied()
+    {
+        draw_pan_marker_scene(scene, cell, pan);
+    }
+
+    if let Some(label) = frame
+        .module
+        .channel_labels
+        .and_then(|labels| labels.get(index))
+        .filter(|label| !label.is_empty())
+        .filter(|_| channel_is_active(samples, cursor_samples))
+    {
+        draw_text_scene(scene, cell, label, TEXT);
+    }
+
+    if let Some(effect) = frame
+        .module
+        .channel_effects
+        .and_then(|effects| effects.get(index))
+        .filter(|effect| !effect.is_empty())
+    {
+        draw_bottom_text_scene(scene, cell, effect, TEXT);
+    }
+}
+
+fn render_scope_trace_scene(
+    scene: &mut Scene,
+    samples: &[f32],
+    cursor_samples: usize,
+    sample_rate: u32,
+    max_history_samples: usize,
+    cell: &LayoutCell,
+    inner_width: usize,
+    scratch: &mut RenderScratch,
+) {
+    let [x0, y0, x1, y1] = cell.rect;
+    let inner_x0 = x0 + 4.0;
+    let inner_x1 = x1 - 4.0;
+    let center = (y0 + y1) * 0.5;
+    let amplitude = ((y1 - y0) * 0.42).max(1.0);
+    let cursor = cursor_samples.min(samples.len());
+    scratch.trace_path.truncate(0);
+
+    if cursor < 2 || inner_width < 2 || sample_rate == 0 {
+        scratch.trace_path.move_to(Point::new(inner_x0 as f64, center as f64));
+        scratch
+            .trace_path
+            .line_to(Point::new(inner_x1 as f64, center as f64));
+        scene.stroke(
+            &Stroke::new(1.5),
+            Affine::IDENTITY,
+            color(TRACE),
+            None,
+            &scratch.trace_path,
+        );
+        return;
+    }
+
+    let lookback = max_history_samples.min(cursor).max(128.min(cursor));
+    let analysis_start = cursor.saturating_sub(lookback);
+    let analysis = &samples[analysis_start..cursor];
+    let dc = mean(analysis);
+    let (period, last_trigger) = estimate_period(analysis, dc, sample_rate);
+    let default_span = ((sample_rate as f32 * 0.020) as usize).max(inner_width * 2);
+    let max_span = lookback.max(default_span);
+    let min_span = (inner_width * 2).min(max_span);
+    let span = period
+        .map(|period| (period.saturating_mul(3)).clamp(min_span, max_span))
+        .unwrap_or(default_span.clamp(min_span, max_span))
+        .min(cursor.max(1));
+
+    let end = match (last_trigger, period) {
+        (Some(last_trigger), Some(period)) if period > 0 => {
+            let anchor = analysis_start + last_trigger;
+            let periods_since = (cursor - anchor) / period;
+            let aligned = anchor + periods_since.saturating_mul(period);
+            aligned.max(span).min(cursor)
+        }
+        _ => cursor,
+    };
+    let start = end.saturating_sub(span);
+    let denominator = (inner_width - 1).max(1) as f32;
+    scratch.trace_samples.clear();
+    let mut max_amp = 0.0f32;
+    let span_minus_one = span.saturating_sub(1) as f32;
+    for x in 0..inner_width {
+        let position = start as f32 + span_minus_one * (x as f32 / denominator);
+        let sample = sample_at(samples, position);
+        max_amp = max_amp.max(sample.abs());
+        scratch.trace_samples.push(sample);
+    }
+
+    let gain = if max_amp > 0.0005 {
+        (0.92 / max_amp).clamp(0.2, 8.0)
+    } else {
+        0.0
+    };
+
+    if let Some((&first, rest)) = scratch.trace_samples.split_first() {
+        let y = center - (first * gain).clamp(-1.0, 1.0) * amplitude;
+        scratch.trace_path.move_to(Point::new(inner_x0 as f64, y as f64));
+        for (offset, sample) in rest.iter().enumerate() {
+            let x = inner_x0 + (inner_x1 - inner_x0) * ((offset + 1) as f32 / denominator);
+            let y = center - (*sample * gain).clamp(-1.0, 1.0) * amplitude;
+            scratch.trace_path.line_to(Point::new(x as f64, y as f64));
+        }
+    }
+
+    scene.stroke(
+        &Stroke::new(1.5),
+        Affine::IDENTITY,
+        color(TRACE),
+        None,
+        &scratch.trace_path,
+    );
+}
+
+#[cfg(test)]
 fn layout_grid(frame: &FrameView<'_>) -> LayoutGrid {
     let count = frame.module.channels.len().max(1);
     let cols = ((count as f64 * frame.width as f64 / frame.height as f64)
@@ -146,67 +307,32 @@ fn layout_grid(frame: &FrameView<'_>) -> LayoutGrid {
     let rows = count.div_ceil(cols);
     let base_cols_per_row = count / rows;
     let extra = count % rows;
-    let mut cells = Vec::with_capacity(count);
+    let mut edges = Vec::with_capacity(count.saturating_sub(1));
 
-    let row_bounds = axis_bounds(frame.height, rows);
     for row in 0..rows {
         let cols_in_row = base_cols_per_row + usize::from(row < extra);
         if cols_in_row == 0 {
             continue;
         }
 
-        let y0 = row_bounds[row];
-        let y1 = row_bounds[row + 1];
-        let col_bounds = axis_bounds(frame.width, cols_in_row);
-        for col in 0..cols_in_row {
-            let x0 = col_bounds[col];
-            let x1 = col_bounds[col + 1];
-            cells.push(LayoutCell {
-                rect: [x0, y0, x1, y1],
-            });
+        let y0 = axis_bound(frame.height, rows, row);
+        let y1 = axis_bound(frame.height, rows, row + 1);
+        let vertical_top = if y0 <= 0.0 { 0.5 } else { y0 - 0.5 };
+        let vertical_bottom = y1 - 0.5;
+        if row + 1 < rows {
+            edges.push([0.5, vertical_bottom, frame.width as f32 - 0.5, vertical_bottom]);
         }
-    }
 
-    let mut edge_set = HashSet::new();
-    let mut edges = Vec::new();
-    for cell in &cells {
-        for edge in cell_edges(*cell) {
-            let key = edge_key(edge);
-            if edge_set.insert(key) {
-                edges.push(edge);
+        for col in 0..cols_in_row {
+            let x0 = axis_bound(frame.width, cols_in_row, col);
+            if col > 0 {
+                let x = x0 - 0.5;
+                edges.push([x, vertical_top, x, vertical_bottom]);
             }
         }
     }
 
-    LayoutGrid { cells, edges }
-}
-
-fn scope_path(trace: &ScopeTrace, cell: &LayoutCell) -> BezPath {
-    let [x0, y0, x1, y1] = cell.rect;
-    let inner_x0 = x0 + 4.0;
-    let inner_x1 = x1 - 4.0;
-    let center = (y0 + y1) * 0.5;
-    let amplitude = ((y1 - y0) * 0.42).max(1.0);
-    let mut path = BezPath::new();
-
-    for (index, &(nx, sample)) in trace.points.iter().enumerate() {
-        let x = inner_x0 + (inner_x1 - inner_x0) * nx.clamp(0.0, 1.0);
-        let y = center - sample * amplitude;
-        if index == 0 {
-            path.move_to(Point::new(x as f64, y as f64));
-        } else {
-            path.line_to(Point::new(x as f64, y as f64));
-        }
-    }
-
-    path
-}
-
-fn stroke_grid(scene: &mut Scene, layout: &LayoutGrid, rgba: [u8; 4]) {
-    for &[x0, y0, x1, y1] in &layout.edges {
-        let rect = edge_rect([x0, y0, x1, y1]);
-        scene.fill(Fill::NonZero, Affine::IDENTITY, color(rgba), None, &rect);
-    }
+    LayoutGrid { edges }
 }
 
 fn draw_pan_marker_scene(scene: &mut Scene, cell: &LayoutCell, pan: f32) {
@@ -265,26 +391,8 @@ fn pan_marker_rect(cell: &LayoutCell, pan: f32) -> [f32; 4] {
     ]
 }
 
-fn axis_bounds(length: u32, parts: usize) -> Vec<f32> {
-    (0..=parts)
-        .map(|index| {
-            ((length as f64 * index as f64 / parts as f64).round() as u32).min(length) as f32
-        })
-        .collect()
-}
-
-fn cell_edges(cell: LayoutCell) -> [[f32; 4]; 4] {
-    let [x0, y0, x1, y1] = cell.rect;
-    let left = if x0 <= 0.0 { 0.5 } else { x0 - 0.5 };
-    let top = if y0 <= 0.0 { 0.5 } else { y0 - 0.5 };
-    let right = x1 - 0.5;
-    let bottom = y1 - 0.5;
-    [
-        [left, top, right, top],
-        [left, bottom, right, bottom],
-        [left, top, left, bottom],
-        [right, top, right, bottom],
-    ]
+fn axis_bound(length: u32, parts: usize, index: usize) -> f32 {
+    ((length as f64 * index as f64 / parts as f64).round() as u32).min(length) as f32
 }
 
 fn vertical_crosshair_rect(cell: &LayoutCell) -> [f32; 4] {
@@ -312,13 +420,71 @@ fn edge_pixel_rect(edge: [f32; 4]) -> [f32; 4] {
     }
 }
 
-fn edge_key(edge: [f32; 4]) -> (i32, i32, i32, i32) {
-    (
-        (edge[0] * 2.0).round() as i32,
-        (edge[1] * 2.0).round() as i32,
-        (edge[2] * 2.0).round() as i32,
-        (edge[3] * 2.0).round() as i32,
-    )
+fn estimate_period(
+    analysis: &[f32],
+    dc: f32,
+    sample_rate: u32,
+) -> (Option<usize>, Option<usize>) {
+    if analysis.len() < 3 {
+        return (None, None);
+    }
+
+    let min_period = (sample_rate as usize / 4_000).max(4);
+    let max_period = (sample_rate as usize / 32).max(min_period + 1);
+    let min_slope = 0.0005f32;
+    let mut last_trigger = None;
+    let mut periods = [0usize; 6];
+    let mut period_count = 0usize;
+
+    for index in 1..analysis.len() {
+        let prev = analysis[index - 1] - dc;
+        let curr = analysis[index] - dc;
+        if prev <= 0.0 && curr > 0.0 && (curr - prev) >= min_slope {
+            if let Some(prev_trigger) = last_trigger {
+                let period = index - prev_trigger;
+                if (min_period..=max_period).contains(&period) {
+                    if period_count < periods.len() {
+                        periods[period_count] = period;
+                        period_count += 1;
+                    } else {
+                        periods.copy_within(1.., 0);
+                        periods[periods.len() - 1] = period;
+                    }
+                }
+            }
+            last_trigger = Some(index);
+        }
+    }
+
+    let period = if period_count == 0 {
+        None
+    } else {
+        periods[..period_count].sort_unstable();
+        Some(periods[period_count / 2])
+    };
+
+    (period, last_trigger)
+}
+
+fn mean(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        0.0
+    } else {
+        samples.iter().copied().sum::<f32>() / samples.len() as f32
+    }
+}
+
+fn sample_at(samples: &[f32], position: f32) -> f32 {
+    let left = position.floor() as usize;
+    let right = position.ceil() as usize;
+    if right >= samples.len() {
+        return *samples.last().unwrap_or(&0.0);
+    }
+    if left == right {
+        return samples[left];
+    }
+    let mix = position - left as f32;
+    samples[left] * (1.0 - mix) + samples[right] * mix
 }
 
 fn channel_is_active(samples: &[f32], cursor_samples: usize) -> bool {

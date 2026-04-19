@@ -2,11 +2,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hound::{SampleFormat, WavSpec, WavWriter};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use tempfile::tempdir;
 
@@ -42,7 +44,7 @@ struct VideoRenderOptions {
 }
 
 enum VideoMessage {
-    Frame(Vec<u8>),
+    Frame(usize),
     Error(String),
 }
 
@@ -274,20 +276,39 @@ fn encode_video(
         show_song_info: args.show_song_info,
     };
     let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
+    let buffer_size = args.width.max(1) as usize * args.height.max(1) as usize * 4;
+    let frame_buffers = Arc::new(
+        (0..FRAME_QUEUE_DEPTH)
+            .map(|_| Mutex::new(vec![0u8; buffer_size]))
+            .collect::<Vec<_>>(),
+    );
+    let (free_tx, free_rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
+    for index in 0..FRAME_QUEUE_DEPTH {
+        free_tx
+            .send(index)
+            .expect("failed to seed frame buffer pool");
+    }
+    let render_buffers = Arc::clone(&frame_buffers);
     let render_handle =
-        thread::spawn(move || render_video_frames(render_options, playlist, tracks, tx));
+        thread::spawn(move || render_video_frames(render_options, playlist, tracks, tx, free_rx, render_buffers));
 
     let mut pipeline_error: Option<anyhow::Error> = None;
     while let Ok(message) = rx.recv() {
         match message {
-            VideoMessage::Frame(rgba) => {
-                if let Err(error) = stdin.write_all(&rgba).with_context(|| {
+            VideoMessage::Frame(index) => {
+                let buffer = frame_buffers[index].lock();
+                if let Err(error) = stdin.write_all(buffer.as_slice()).with_context(|| {
                     format!(
                         "failed to stream raw video to ffmpeg for {}",
                         args.output.display()
                     )
                 }) {
                     pipeline_error = Some(error);
+                    break;
+                }
+                drop(buffer);
+                if free_tx.send(index).is_err() {
+                    pipeline_error = Some(anyhow!("frame buffer pool closed unexpectedly"));
                     break;
                 }
             }
@@ -299,6 +320,7 @@ fn encode_video(
     }
 
     if pipeline_error.is_some() {
+        drop(free_tx);
         let _ = ffmpeg.kill();
     }
     drop(stdin);
@@ -326,6 +348,8 @@ fn render_video_frames(
     playlist: Vec<PlaylistEntry>,
     tracks: Vec<RenderedTrackInfo>,
     tx: SyncSender<VideoMessage>,
+    free_rx: mpsc::Receiver<usize>,
+    frame_buffers: Arc<Vec<Mutex<Vec<u8>>>>,
 ) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut frame_renderer =
@@ -357,13 +381,20 @@ fn render_video_frames(
                         song_info: options.show_song_info.then_some(track.song_info.as_str()),
                     },
                 };
-                let rgba = frame_renderer.render(&frame).with_context(|| {
+                let index = free_rx
+                    .recv()
+                    .map_err(|_| anyhow!("frame buffer pool closed unexpectedly"))?;
+                let mut buffer = frame_buffers[index].lock();
+                frame_renderer
+                    .render_into(&frame, buffer.as_mut_slice())
+                    .with_context(|| {
                     format!(
                         "failed to render video frame for {}",
                         entry.source.path.display()
                     )
                 })?;
-                tx.send(VideoMessage::Frame(rgba))
+                drop(buffer);
+                tx.send(VideoMessage::Frame(index))
                     .map_err(|_| anyhow!("video frame queue closed unexpectedly"))?;
             }
         }

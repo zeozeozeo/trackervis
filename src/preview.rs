@@ -111,11 +111,15 @@ where
     let channels = config.channels as usize;
     Ok(device.build_output_stream(
         config,
-        move |data: &mut [T], _| {
-            let mut scratch = vec![0.0f32; data.len()];
-            engine.lock().render(&mut scratch, channels);
-            for (dst, src) in data.iter_mut().zip(scratch) {
-                *dst = T::from_sample(src);
+        {
+            let mut scratch = Vec::<f32>::new();
+            move |data: &mut [T], _| {
+                scratch.clear();
+                scratch.resize(data.len(), 0.0f32);
+                engine.lock().render(&mut scratch, channels);
+                for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
+                    *dst = T::from_sample(src);
+                }
             }
         },
         move |error| eprintln!("audio stream error: {error}"),
@@ -131,6 +135,7 @@ struct PreviewApp {
     recursive: bool,
     window: Option<&'static Window>,
     renderer: Option<VelloSurfaceRenderer>,
+    last_title_key: Option<(String, String)>,
 }
 
 impl PreviewApp {
@@ -149,6 +154,7 @@ impl PreviewApp {
             recursive,
             window: None,
             renderer: None,
+            last_title_key: None,
         }
     }
 }
@@ -216,28 +222,66 @@ impl ApplicationHandler for PreviewApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let state = self.shared.lock().clone();
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, self.window) {
+                    let (
+                        channel_samples,
+                        channel_panning,
+                        channel_labels,
+                        channel_effects,
+                        local_time_seconds,
+                        sample_rate,
+                        max_history_samples,
+                        show_song_info,
+                        song_info,
+                        title_key,
+                    ) = {
+                        let state = self.shared.lock();
+                        let title_key_changed = self.last_title_key.as_ref().map_or(true, |(label, filename)| {
+                            label != &state.label || filename != &state.filename
+                        });
+                        let title_key = if title_key_changed {
+                            Some((state.label.clone(), state.filename.clone()))
+                        } else {
+                            None
+                        };
+                        (
+                            Arc::clone(&state.channel_samples),
+                            state.channel_panning.as_ref().map(Arc::clone),
+                            Arc::clone(&state.channel_labels),
+                            Arc::clone(&state.channel_effects),
+                            state.local_time_seconds,
+                            state.sample_rate,
+                            state.max_history_samples,
+                            state.show_song_info,
+                            Arc::clone(&state.song_info),
+                            title_key,
+                        )
+                    };
+
+                    if let Some((label, filename)) = title_key {
+                        let title = if filename.is_empty() {
+                            format!("trackervis - {}", label)
+                        } else {
+                            format!("trackervis - {} ({})", label, filename)
+                        };
+                        window.set_title(&title);
+                        self.last_title_key = Some((label, filename));
+                    }
+
                     let frame = FrameView {
                         width: renderer.size.width.max(1),
                         height: renderer.size.height.max(1),
-                        max_history_samples: state.max_history_samples,
+                        max_history_samples,
                         module: FrameModule {
-                            local_time_seconds: state.local_time_seconds,
-                            sample_rate: state.sample_rate,
-                            channels: &state.channel_samples,
-                            channel_panning: state.channel_panning.as_deref(),
-                            channel_labels: Some(&state.channel_labels),
-                            channel_effects: Some(&state.channel_effects),
-                            song_info: state.show_song_info.then_some(state.song_info.as_str()),
+                            local_time_seconds,
+                            sample_rate,
+                            channels: channel_samples.as_ref(),
+                            channel_panning: channel_panning.as_deref(),
+                            channel_labels: Some(channel_labels.as_ref()),
+                            channel_effects: Some(channel_effects.as_ref()),
+                            song_info: show_song_info.then_some(song_info.as_ref()),
                         },
                     };
-                    let title = if state.filename.is_empty() {
-                        format!("trackervis - {}", state.label)
-                    } else {
-                        format!("trackervis - {} ({})", state.label, state.filename)
-                    };
-                    window.set_title(&title);
                     renderer.render(&frame).expect("preview render failed");
                 }
             }
@@ -256,15 +300,15 @@ impl ApplicationHandler for PreviewApp {
 struct PreviewVisualState {
     label: String,
     filename: String,
-    song_info: String,
+    song_info: Arc<str>,
     show_song_info: bool,
     local_time_seconds: f64,
     sample_rate: u32,
     max_history_samples: usize,
-    channel_samples: Vec<Vec<f32>>,
-    channel_panning: Option<Vec<f32>>,
-    channel_labels: Vec<String>,
-    channel_effects: Vec<String>,
+    channel_samples: Arc<[Vec<f32>]>,
+    channel_panning: Option<Arc<[f32]>>,
+    channel_labels: Arc<[String]>,
+    channel_effects: Arc<[String]>,
 }
 
 impl PreviewVisualState {
@@ -272,15 +316,15 @@ impl PreviewVisualState {
         Self {
             label: "loading".to_owned(),
             filename: String::new(),
-            song_info: String::new(),
+            song_info: Arc::from(""),
             show_song_info,
             local_time_seconds: 0.0,
             sample_rate,
             max_history_samples,
-            channel_samples: vec![vec![0.0; 2]],
+            channel_samples: Arc::from(vec![vec![0.0; 2]]),
             channel_panning: None,
-            channel_labels: vec![String::new()],
-            channel_effects: vec![String::new()],
+            channel_labels: Arc::from(vec![String::new()]),
+            channel_effects: Arc::from(vec![String::new()]),
         }
     }
 }
@@ -492,7 +536,7 @@ impl AudioEngine {
             let mut shared = self.shared.lock();
             shared.label = label;
             shared.filename = filename;
-            shared.song_info = song_info;
+            shared.song_info = Arc::from(song_info);
         }
         self.frames_since_snapshot = self.snapshot_interval_frames;
         self.publish_state();
@@ -519,10 +563,11 @@ impl AudioEngine {
             .histories
             .iter()
             .map(SampleHistory::snapshot)
-            .collect();
-        shared.channel_panning = current.channel_panning.clone();
-        shared.channel_labels = current.channel_labels.clone();
-        shared.channel_effects = current.channel_effects.clone();
+            .collect::<Vec<_>>()
+            .into();
+        shared.channel_panning = current.channel_panning.clone().map(Arc::from);
+        shared.channel_labels = current.channel_labels.clone().into();
+        shared.channel_effects = current.channel_effects.clone().into();
     }
 }
 
